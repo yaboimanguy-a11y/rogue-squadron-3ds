@@ -151,6 +151,66 @@ def patch_state(sub, patch):
     return "conflict"
 
 
+# The libraries the 3DS build uses, as (parent repository, path in it). Fetched with plain clone/checkout instead of
+# "git submodule": on Windows that runs through a shell layer that fails to start on some PCs (fork / cygheap errors).
+# The PC graphics libraries under rt64 are large and not needed.
+SUBMODULES = [
+    (".", "syms"),
+    (".", "lib/N64ModernRuntime"),
+    (".", "lib/rt64"),
+    ("lib/N64ModernRuntime", "thirdparty/xxHash"),
+    ("lib/N64ModernRuntime", "thirdparty/miniz"),
+    ("lib/N64ModernRuntime", "thirdparty/o1heap"),
+    ("lib/N64ModernRuntime", "N64Recomp/lib/ELFIO"),
+    ("lib/N64ModernRuntime", "N64Recomp/lib/fmt"),
+    ("lib/N64ModernRuntime", "N64Recomp/lib/rabbitizer"),
+    ("lib/N64ModernRuntime", "N64Recomp/lib/sljit"),
+    ("lib/N64ModernRuntime", "N64Recomp/lib/tomlplusplus"),
+    ("lib/rt64", "src/contrib/hlslpp"),
+    ("lib/rt64", "src/contrib/xxHash"),
+]
+
+
+def git_out(*args, cwd=REPO):
+    r = quiet(["git"] + list(args), cwd=cwd)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def retry(cmd, cwd=REPO, tries=3):
+    for i in range(tries):
+        if run(cmd, cwd=cwd, check=False) == 0:
+            return
+        print(f"(retrying, {i + 1}/{tries - 1})" if i + 1 < tries else "")
+    fail(f"{' '.join(str(c) for c in cmd[:3])} failed; check your internet connection and run the setup again")
+
+
+def sync_submodules():
+    for parent, path in SUBMODULES:
+        pdir, sdir = REPO / parent, REPO / parent / path
+        tree = git_out("ls-tree", "HEAD", path, cwd=pdir).split()
+        if len(tree) < 3 or tree[1] != "commit":
+            fail(f"{parent}/{path} is not a submodule of this checkout")
+        want = tree[2]
+        url = ""
+        for line in git_out("config", "-f", ".gitmodules", "--get-regexp", r"submodule\..*\.path", cwd=pdir).splitlines():
+            key, _, val = line.partition(" ")
+            if val == path:
+                url = git_out("config", "-f", ".gitmodules", key[:-len(".path")] + ".url", cwd=pdir)
+        if not url:
+            fail(f"no URL for {parent}/{path} in .gitmodules")
+        has_repo = (sdir / ".git").exists()
+        if has_repo and git_out("rev-parse", "HEAD", cwd=sdir) == want:
+            continue
+        print(f"Fetching {path} ({want[:8]})")
+        if not has_repo:
+            if sdir.exists() and not any(sdir.iterdir()):
+                sdir.rmdir()
+            retry(["git", "clone", "--no-checkout", "--filter=blob:none", url, sdir])
+        if not git_out("cat-file", "-t", want, cwd=sdir):
+            retry(["git", "fetch", "origin", want], cwd=sdir)
+        run(["git", "-c", "advice.detachedHead=false", "checkout", "-q", "--force", want], cwd=sdir)
+
+
 def update_sources(pull):
     step("Updating the sources")
     # take the 3DS patches off first so the submodules can move to new commits
@@ -160,10 +220,7 @@ def update_sources(pull):
     if pull and (REPO / ".git").exists():
         if run(["git", "pull", "--ff-only"], check=False) != 0:
             print("git pull failed (local changes?); building what is here")
-    # only what the 3DS build uses (the PC graphics libraries under rt64 are large and not needed)
-    run(["git", "submodule", "update", "--init", "syms", "lib/rt64"])
-    run(["git", "submodule", "update", "--init", "--recursive", "lib/N64ModernRuntime"])
-    run(["git", "-C", REPO / "lib/rt64", "submodule", "update", "--init", "src/contrib/hlslpp", "src/contrib/xxHash"])
+    sync_submodules()
     for sub, patch in PATCHES:
         st = patch_state(sub, patch)
         if st == "clean":
